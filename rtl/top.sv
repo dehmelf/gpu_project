@@ -1,8 +1,6 @@
 `timescale 1ns/1ps
 `default_nettype none
 
-`include "ctrl/cfg_pkg.sv"
-
 module top #(
   parameter int N       = cfg_pkg::ARRAY_N,
   parameter int DATA_W  = cfg_pkg::DATA_W,
@@ -105,7 +103,7 @@ module top #(
     .re(c_rd_en), .raddr(c_rd_addr), .rdata(c_rd_data)
   );
 
-  // Array instance
+  // Array instance (present for structure; not used in this simplified top compute path)
   logic signed [DATA_W-1:0] a_west [N];
   logic signed [DATA_W-1:0] b_north[N];
   logic signed [ACC_W-1:0]  c_south[N];
@@ -113,35 +111,45 @@ module top #(
   logic c_v [N], c_r [N];
 
   for (genvar i=0;i<N;i++) begin
-    assign a_v[i] = compute_cycle; // drive when computing
-    assign b_v[i] = compute_cycle;
+    assign a_v[i] = 1'b0; // not driving array in this simplified path
+    assign b_v[i] = 1'b0;
     assign c_r[i] = 1'b1;
   end
 
   systolic_array #(.N(N), .DATA_W(DATA_W), .ACC_W(ACC_W)) u_array (
-    .clk, .rst_n, .en(compute_cycle),
+    .clk, .rst_n, .en(1'b0),
     .a_west(a_west), .a_valid(a_v), .a_ready(a_r),
     .b_north(b_north), .b_valid(b_v), .b_ready(b_r),
     .c_south(c_south), .c_valid(c_v), .c_ready(c_r)
   );
 
-  // Simple controller: LOAD -> COMPUTE -> STORE (write C)
+  // Simple controller: LOAD -> COMPUTE -> DONE
   typedef enum logic [1:0] {S_IDLE, S_WAIT_LOAD, S_COMPUTE, S_DONE} state_e;
   state_e state;
   logic [15:0] m_l, n_l, k_l;
   logic [$clog2(N):0] row, col;
   logic [$clog2(N):0] kk;
 
+  // BRAM read sampling (1-cycle latency)
+  logic signed [DATA_W-1:0] a_sample, b_sample;
+  logic samp_valid;
+  logic signed [ACC_W-1:0] acc_reg;
+
   always_ff @(posedge clk) begin
     if (!rst_n) begin
       state <= S_IDLE; done <= 1'b0; compute_cycle <= 1'b0; stall_cycle <= 1'b0;
       m_l <= '0; n_l <= '0; k_l <= '0; row <= '0; col <= '0; kk <= '0;
       a_re <= 1'b0; b_re <= 1'b0; c_we <= 1'b0; c_waddr <= '0; c_wdata <= '0; a_raddr <= '0; b_raddr <= '0;
+      a_sample <= '0; b_sample <= '0; samp_valid <= 1'b0; acc_reg <= '0;
     end else begin
       c_we <= 1'b0; a_re <= 1'b0; b_re <= 1'b0; compute_cycle <= 1'b0; stall_cycle <= 1'b0;
+      // capture synchronous read data
+      a_sample <= a_rdata;
+      b_sample <= b_rdata;
+
       unique case (state)
         S_IDLE: begin
-          done <= 1'b0;
+          done <= 1'b0; samp_valid <= 1'b0; acc_reg <= '0;
           if (start_pulse) begin
             m_l <= (m==0)? N : m[15:0];
             n_l <= (n==0)? N : n[15:0];
@@ -151,26 +159,29 @@ module top #(
         end
         S_WAIT_LOAD: begin
           if (a_load_done && b_load_done) begin
-            kk <= 0; row <= 0; col <= 0; c_waddr <= 0;
+            kk <= 0; row <= 0; col <= 0; c_waddr <= 0; acc_reg <= '0; samp_valid <= 1'b0;
             state <= S_COMPUTE;
           end
         end
         S_COMPUTE: begin
-          // feed edges from BRAM: a[row, kk], b[kk, col]
-          // Addressing: A row-major [row*N + kk], B row-major [kk*N + col]
+          // Issue reads for current kk (data available next cycle)
           a_raddr <= row*N + kk; a_re <= 1'b1;
           b_raddr <= kk*N + col; b_re <= 1'b1;
-          a_west[row]  <= a_rdata;
-          b_north[col] <= b_rdata;
           compute_cycle <= 1'b1;
 
-          // Accumulate and write C when kk reaches k_l-1
+          if (samp_valid) begin
+            acc_reg <= acc_reg + (a_sample * b_sample);
+          end
+          samp_valid <= 1'b1;
+
           if (kk == k_l-1) begin
-            // write result c[row,col]
-            c_waddr <= row*N + col;
-            c_wdata <= c_south[row];
-            c_we    <= 1'b1;
-            kk <= 0;
+            // After last multiply, write result on next cycle using accumulated value plus last sample
+            if (samp_valid) begin
+              c_waddr <= row*N + col;
+              c_wdata <= acc_reg + (a_rdata * b_rdata); // last product
+              c_we    <= 1'b1;
+            end
+            acc_reg <= '0; samp_valid <= 1'b0; kk <= 0;
             if (col == n_l-1) begin
               col <= 0;
               if (row == m_l-1) begin
