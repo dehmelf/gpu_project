@@ -1,0 +1,27 @@
+name: sv
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  verilate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Verilator
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y verilator build-essential python3
+      - name: Lint
+        run: |
+          cd sim && make lint
+      - name: Sim
+        run: |
+          cd sim && make sim
+      - name: Upload VCD on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: waves
+          path: sim/obj_dir/*.vcd 
